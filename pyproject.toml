@@ -8,4 +8,5 @@ dependencies = [
     "langchain-openai>=0.2,<2",
     "langgraph>=0.2,<2",
     "python-dotenv>=1,<2",
+    "requests>=2.32,<3",
 ]
