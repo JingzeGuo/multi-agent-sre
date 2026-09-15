@@ -43,11 +43,12 @@ class RoutingTests(unittest.TestCase):
             }
         )
 
-        with patch.object(agents, "_model", return_value=model):
+        with patch.object(agents, "_model", return_value=model) as model_factory:
             result = agents.router_agent(
                 {"incident": "International shipping quotes are slow."}
             )
 
+        model_factory.assert_called_once_with(thinking=False)
         self.assertEqual(result["selected_agents"], ["shipping", "checkout"])
         self.assertFalse(result["router_fallback"])
         prompt = "\n".join(
@@ -127,9 +128,10 @@ class RoutingTests(unittest.TestCase):
             "activated_agents": ["shipping", "checkout"],
         }
 
-        with patch.object(agents, "_model", return_value=model):
+        with patch.object(agents, "_model", return_value=model) as model_factory:
             result = agents.coordinator_assess(state)
 
+        model_factory.assert_called_once_with(thinking=False)
         self.assertEqual(result["followup_agent"], "checkout")
 
     def test_graph_contains_optional_followup_path(self):

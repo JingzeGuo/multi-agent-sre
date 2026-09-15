@@ -3,7 +3,7 @@
 import operator
 import os
 import threading
-from typing import Annotated, Literal, TypedDict, cast
+from typing import Annotated, Any, Literal, TypedDict, cast
 
 from dotenv import load_dotenv
 from langchain_core.messages import (
@@ -112,11 +112,16 @@ SERVICE_CONFIG: dict[AgentName, tuple[str, list[BaseTool]]] = {
 }
 
 
-def _model() -> ChatOpenAI:
-    return ChatOpenAI(
+def _model(*, thinking: bool | None = None) -> ChatOpenAI:
+    config: dict[str, Any] = {
         **MODEL_CONFIG,
-        api_key=os.environ["DEEPSEEK_API_KEY"],
-    )
+        "api_key": os.environ["DEEPSEEK_API_KEY"],
+    }
+    if thinking is not None:
+        config["extra_body"] = {
+            "thinking": {"type": "enabled" if thinking else "disabled"}
+        }
+    return ChatOpenAI(**config)
 
 
 def _unique_agents(agents: object, limit: int | None = None) -> list[AgentName]:
@@ -153,7 +158,7 @@ Service topology:
     ]
 
     try:
-        raw_decision = _model().with_structured_output(
+        raw_decision = _model(thinking=False).with_structured_output(
             RouterDecision,
             method="function_calling",
         ).invoke(messages)
@@ -388,7 +393,7 @@ Peer messages:
 Return next_agent as one eligible service name, or "none", plus a brief reason."""
 
     try:
-        decision = _model().with_structured_output(
+        decision = _model(thinking=False).with_structured_output(
             FollowupDecision,
             method="function_calling",
         ).invoke(prompt)
