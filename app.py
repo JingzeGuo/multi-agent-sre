@@ -1,33 +1,46 @@
-"""Minimal parallel multi-agent SRE workflow."""
+"""Adaptive multi-agent SRE workflow with selective specialist activation."""
 
 from langgraph.graph import END, START, StateGraph
 
 from agents import (
+    AGENT_NAMES,
     PeerBudget,
     SREState,
-    checkout_agent,
+    coordinator_assess,
+    dispatch_selected,
     final_coordinator,
-    payment_agent,
-    shipping_agent,
+    route_after_assessment,
+    router_agent,
+    service_investigator,
+    targeted_followup,
 )
 
 
 def build_graph():
     builder = StateGraph(SREState)
 
-    builder.add_node("checkout_agent", checkout_agent)
-    builder.add_node("payment_agent", payment_agent)
-    builder.add_node("shipping_agent", shipping_agent)
+    builder.add_node("router", router_agent)
+    builder.add_node("service_investigator", service_investigator)
+    builder.add_node("coordinator_assess", coordinator_assess)
+    builder.add_node("targeted_followup", targeted_followup)
     builder.add_node("final_coordinator", final_coordinator)
 
-    builder.add_edge(START, "checkout_agent")
-    builder.add_edge(START, "payment_agent")
-    builder.add_edge(START, "shipping_agent")
-
-    builder.add_edge(
-        ["checkout_agent", "payment_agent", "shipping_agent"],
-        "final_coordinator",
+    builder.add_edge(START, "router")
+    builder.add_conditional_edges(
+        "router",
+        dispatch_selected,
+        ["service_investigator"],
     )
+    builder.add_edge("service_investigator", "coordinator_assess")
+    builder.add_conditional_edges(
+        "coordinator_assess",
+        route_after_assessment,
+        {
+            "followup": "targeted_followup",
+            "final": "final_coordinator",
+        },
+    )
+    builder.add_edge("targeted_followup", "final_coordinator")
     builder.add_edge("final_coordinator", END)
 
     return builder.compile()
@@ -43,12 +56,17 @@ def main() -> None:
         }
     )
 
-    print("\n=== Checkout Agent ===")
-    print(result["checkout_report"])
-    print("\n=== Payment Agent ===")
-    print(result["payment_report"])
-    print("\n=== Shipping Agent ===")
-    print(result["shipping_report"])
+    print("\n=== Router ===")
+    print(f"Selected: {', '.join(result['selected_agents'])}")
+    print(f"Reason: {result['routing_reason']}")
+    if result["router_fallback"]:
+        print("Mode: all-agent safety fallback")
+
+    for agent in AGENT_NAMES:
+        report = result.get(f"{agent}_report")
+        if report is not None:
+            print(f"\n=== {agent.title()} Agent ===")
+            print(report)
 
     if result["peer_messages"]:
         print("\n=== Peer Messages ===")
@@ -61,6 +79,10 @@ def main() -> None:
     else:
         print("\n=== Peer Messages ===")
         print("No peer communication was needed.")
+
+    print("\n=== Activation Summary ===")
+    print(f"Actually activated: {', '.join(result['activated_agents'])}")
+    print(f"Coverage assessment: {result['followup_reason']}")
 
     print("\n=== Final Diagnosis ===")
     print(result["final_diagnosis"])

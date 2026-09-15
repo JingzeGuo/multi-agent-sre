@@ -1,9 +1,9 @@
-"""LLM-backed service investigators and coordinator."""
+"""LLM-backed routing, service investigation, and incident coordination."""
 
 import operator
 import os
 import threading
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal, TypedDict, cast
 
 from dotenv import load_dotenv
 from langchain_core.messages import (
@@ -14,6 +14,7 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
+from langgraph.types import Send
 
 from tools import CHECKOUT_TOOLS, PAYMENT_TOOLS, SHIPPING_TOOLS
 
@@ -28,8 +29,30 @@ MODEL_CONFIG = {
 INITIAL_TOOL_CALLS = 5
 PEER_TOOL_CALLS = 2
 MAX_PEER_MESSAGES = 2
+MAX_INITIAL_AGENTS = 2
 
 AgentName = Literal["checkout", "payment", "shipping"]
+AGENT_NAMES: tuple[AgentName, ...] = ("checkout", "payment", "shipping")
+
+SERVICE_DESCRIPTIONS: dict[AgentName, str] = {
+    "checkout": "handles cart checkout and order placement; calls Payment and Shipping",
+    "payment": "handles payment authorization and card charging",
+    "shipping": "handles shipping quotes, delivery options, and shipment creation",
+}
+
+
+class RouterDecision(TypedDict):
+    """Structured output produced by the telemetry-blind router."""
+
+    selected_agents: list[AgentName]
+    reason: str
+
+
+class FollowupDecision(TypedDict):
+    """Coordinator decision after reading the available specialist reports."""
+
+    next_agent: Literal["checkout", "payment", "shipping", "none"]
+    reason: str
 
 
 class PeerMessage(TypedDict):
@@ -37,6 +60,13 @@ class PeerMessage(TypedDict):
     recipient: AgentName
     question: str
     response: str
+
+
+def _merge_unique_agents(
+    current: list[AgentName],
+    update: list[AgentName],
+) -> list[AgentName]:
+    return list(dict.fromkeys([*current, *update]))
 
 
 class PeerBudget:
@@ -60,11 +90,18 @@ class PeerBudget:
 
 class SREState(TypedDict):
     incident: str
+    investigation_agent: AgentName
+    selected_agents: list[AgentName]
+    routing_reason: str
+    router_fallback: bool
     checkout_report: str | None
     payment_report: str | None
     shipping_report: str | None
     peer_budget: PeerBudget
     peer_messages: Annotated[list[PeerMessage], operator.add]
+    activated_agents: Annotated[list[AgentName], _merge_unique_agents]
+    followup_agent: AgentName | None
+    followup_reason: str
     final_diagnosis: str | None
 
 
@@ -80,6 +117,68 @@ def _model() -> ChatOpenAI:
         **MODEL_CONFIG,
         api_key=os.environ["DEEPSEEK_API_KEY"],
     )
+
+
+def _unique_agents(agents: object, limit: int | None = None) -> list[AgentName]:
+    if not isinstance(agents, list):
+        return []
+
+    selected: list[AgentName] = []
+    for agent in agents:
+        if agent in AGENT_NAMES and agent not in selected:
+            selected.append(cast(AgentName, agent))
+        if limit is not None and len(selected) == limit:
+            break
+    return selected
+
+
+def router_agent(state: SREState) -> dict[str, object]:
+    """Select at most two initial specialists without access to telemetry."""
+    topology = "\n".join(
+        f"- {agent}: {description}"
+        for agent, description in SERVICE_DESCRIPTIONS.items()
+    )
+    messages = [
+        SystemMessage(
+            content=f"""You are an incident triage router, not a diagnostician.
+Choose the smallest useful set of one or two service agents to investigate first.
+Use only the incident description and static service topology below. You have no
+access to logs, traces, metrics, health status, or previous investigation results.
+Do not claim a root cause. Return selected_agents and a brief routing reason.
+
+Service topology:
+{topology}"""
+        ),
+        HumanMessage(content=f"Incident: {state['incident']}"),
+    ]
+
+    try:
+        raw_decision = _model().with_structured_output(
+            RouterDecision,
+            method="function_calling",
+        ).invoke(messages)
+        selected = _unique_agents(
+            raw_decision.get("selected_agents"),
+            MAX_INITIAL_AGENTS,
+        )
+        reason = str(raw_decision.get("reason", "")).strip()
+        if not selected or not reason:
+            raise ValueError("router returned an empty or invalid decision")
+        return {
+            "selected_agents": selected,
+            "routing_reason": reason,
+            "router_fallback": False,
+        }
+    except Exception as error:
+        # Availability is more important than cost when triage itself is unavailable.
+        print(f"\n[Router] Falling back to all agents: {error}")
+        return {
+            "selected_agents": list(AGENT_NAMES),
+            "routing_reason": (
+                "Router failed, so all service agents were activated as a safe fallback."
+            ),
+            "router_fallback": True,
+        }
 
 
 def _run_tool_loop(
@@ -153,7 +252,7 @@ def _peer_tool(
 ) -> BaseTool:
     @tool
     def ask_agent(agent_name: AgentName, question: str) -> str:
-        """Ask one other service agent one targeted, non-recursive question."""
+        """Activate another service agent for one targeted, non-recursive question."""
         if agent_name == sender:
             return "Choose another service agent, not yourself."
 
@@ -192,9 +291,9 @@ def _investigate(
 Investigate independently using only the supplied {service} tools.
 Call one tool at a time and make at most {INITIAL_TOOL_CALLS} tool calls.
 If local evidence leaves a specific dependency uncertainty, you may use ask_agent
-once to ask the responsible peer. Do not ask unless its answer could change or
-materially strengthen your diagnosis. Incorporate any peer evidence in your report.
-Do not invent information.
+once to activate the responsible peer for a targeted check. Do not ask unless its
+answer could change or materially strengthen your diagnosis. Incorporate any peer
+evidence in your report. Do not invent information.
 
 When you have enough evidence, return a concise report with:
 - service health status
@@ -214,40 +313,144 @@ When you have enough evidence, return a concise report with:
     return report, peer_messages
 
 
-def checkout_agent(state: SREState) -> dict[str, object]:
+def dispatch_selected(state: SREState) -> list[Send]:
+    """Fan out graph tasks only for the specialists selected by the router."""
+    selected = _unique_agents(state.get("selected_agents")) or list(AGENT_NAMES)
+    return [
+        Send(
+            "service_investigator",
+            {
+                "incident": state["incident"],
+                "investigation_agent": agent,
+                "peer_budget": state["peer_budget"],
+            },
+        )
+        for agent in selected
+    ]
+
+
+def service_investigator(state: SREState) -> dict[str, object]:
+    """Run one dynamically selected service specialist."""
+    agent = state["investigation_agent"]
     report, peer_messages = _investigate(
-        "checkout", state["incident"], state["peer_budget"]
+        agent,
+        state["incident"],
+        state["peer_budget"],
     )
-    return {"checkout_report": report, "peer_messages": peer_messages}
+    activated = [agent]
+    for message in peer_messages:
+        if message["recipient"] not in activated:
+            activated.append(message["recipient"])
+
+    return {
+        f"{agent}_report": report,
+        "peer_messages": peer_messages,
+        "activated_agents": activated,
+    }
 
 
-def payment_agent(state: SREState) -> dict[str, object]:
+def _report_summary(state: SREState) -> str:
+    sections = []
+    for agent in AGENT_NAMES:
+        report = state.get(f"{agent}_report")
+        sections.append(
+            f"{agent.title()} report:\n{report or '[not activated / no report]'}"
+        )
+    return "\n\n".join(sections)
+
+
+def coordinator_assess(state: SREState) -> dict[str, object]:
+    """Request at most one full follow-up from a still-unseen service domain."""
+    activated = _unique_agents(state.get("activated_agents"))
+    remaining = [agent for agent in AGENT_NAMES if not state.get(f"{agent}_report")]
+    if not remaining:
+        return {
+            "followup_agent": None,
+            "followup_reason": "All relevant service domains have already been reached.",
+        }
+
+    prompt = f"""You are an incident coordinator assessing investigation coverage.
+You may request one full follow-up investigation only if the current evidence points
+to a specific uninvestigated service and that report could materially change the RCA.
+Do not request broader investigation merely for completeness. You can only read the
+specialist reports and peer messages below; you have no raw telemetry access.
+
+Incident: {state['incident']}
+Initially selected: {', '.join(state['selected_agents'])}
+Already activated (including peer checks): {', '.join(activated)}
+Eligible follow-up agents: {', '.join(remaining)}
+
+{_report_summary(state)}
+
+Peer messages:
+{state.get('peer_messages') or '[none]'}
+
+Return next_agent as one eligible service name, or "none", plus a brief reason."""
+
+    try:
+        decision = _model().with_structured_output(
+            FollowupDecision,
+            method="function_calling",
+        ).invoke(prompt)
+        next_agent = decision.get("next_agent", "none")
+        reason = str(decision.get("reason", "")).strip()
+        if next_agent in remaining:
+            return {
+                "followup_agent": cast(AgentName, next_agent),
+                "followup_reason": reason or "Coordinator requested more evidence.",
+            }
+        return {
+            "followup_agent": None,
+            "followup_reason": reason or "Current reports are sufficient for synthesis.",
+        }
+    except Exception as error:
+        print(f"\n[Coordinator] Coverage assessment failed: {error}")
+        return {
+            "followup_agent": None,
+            "followup_reason": (
+                "Coverage assessment failed; continuing with the available evidence."
+            ),
+        }
+
+
+def route_after_assessment(state: SREState) -> Literal["followup", "final"]:
+    return "followup" if state.get("followup_agent") else "final"
+
+
+def targeted_followup(state: SREState) -> dict[str, object]:
+    agent = state.get("followup_agent")
+    if agent is None:
+        return {}
+
     report, peer_messages = _investigate(
-        "payment", state["incident"], state["peer_budget"]
+        agent,
+        state["incident"],
+        state["peer_budget"],
     )
-    return {"payment_report": report, "peer_messages": peer_messages}
+    activated = [agent, *(message["recipient"] for message in peer_messages)]
 
-
-def shipping_agent(state: SREState) -> dict[str, object]:
-    report, peer_messages = _investigate(
-        "shipping", state["incident"], state["peer_budget"]
-    )
-    return {"shipping_report": report, "peer_messages": peer_messages}
+    return {
+        f"{agent}_report": report,
+        "peer_messages": peer_messages,
+        "activated_agents": activated,
+    }
 
 
 def final_coordinator(state: SREState) -> dict[str, str]:
-    prompt = f"""You are the incident coordinator. Synthesize the service reports.
+    prompt = f"""You are the incident coordinator. Synthesize the available service
+reports into a final diagnosis. A missing report means that service was not activated;
+it is not evidence that the service is healthy.
 
-Incident: {state["incident"]}
+Incident: {state['incident']}
+Initially selected agents: {', '.join(state['selected_agents'])}
+Routing reason: {state['routing_reason']}
+Actually activated agents: {', '.join(state['activated_agents'])}
+Coverage assessment: {state['followup_reason']}
 
-Checkout report:
-{state["checkout_report"]}
+{_report_summary(state)}
 
-Payment report:
-{state["payment_report"]}
-
-Shipping report:
-{state["shipping_report"]}
+Peer messages:
+{state.get('peer_messages') or '[none]'}
 
 Return a concise final diagnosis with:
 - root cause
@@ -255,5 +458,7 @@ Return a concise final diagnosis with:
 - supporting evidence
 - confidence
 
-Use only the reports above. Do not invent information."""
+Use only the reports and peer evidence above. Do not invent information. Explicitly
+state when the evidence is insufficient instead of treating an uninvestigated service
+as healthy."""
     return {"final_diagnosis": _model().invoke(prompt).content}
