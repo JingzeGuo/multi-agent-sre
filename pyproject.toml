@@ -1,6 +1,6 @@
 [project]
 name = "multi-agent-sre"
-version = "0.2.0"
+version = "0.3.0"
 description = "Safe collaborative multi-agent SRE under partial observability"
 requires-python = ">=3.10"
 dependencies = [
