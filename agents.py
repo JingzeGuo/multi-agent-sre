@@ -2,11 +2,17 @@
 
 import operator
 import os
+import threading
 from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import BaseTool
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
 
 from tools import CHECKOUT_TOOLS, PAYMENT_TOOLS, SHIPPING_TOOLS
@@ -20,26 +26,36 @@ MODEL_CONFIG = {
 }
 
 INITIAL_TOOL_CALLS = 5
-FOLLOWUP_TOOL_CALLS = 2
+PEER_TOOL_CALLS = 2
+MAX_PEER_MESSAGES = 2
 
 AgentName = Literal["checkout", "payment", "shipping"]
 
 
-class FollowUpRequest(TypedDict):
-    agent: AgentName
+class PeerMessage(TypedDict):
+    sender: AgentName
+    recipient: AgentName
     question: str
+    response: str
 
 
-class CoordinatorAssessment(TypedDict):
-    status: Literal["sufficient", "needs_followup"]
-    followups: list[FollowUpRequest]
+class PeerBudget:
+    """Per-run, thread-safe communication limits."""
 
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._senders: set[AgentName] = set()
+        self._total = 0
 
-class FollowUpState(TypedDict):
-    incident: str
-    agent: AgentName
-    previous_report: str
-    question: str
+    def reserve(self, sender: AgentName) -> str | None:
+        with self._lock:
+            if sender in self._senders:
+                return "You have already used your one peer question."
+            if self._total >= MAX_PEER_MESSAGES:
+                return "The global peer-message limit has been reached."
+            self._senders.add(sender)
+            self._total += 1
+        return None
 
 
 class SREState(TypedDict):
@@ -47,18 +63,22 @@ class SREState(TypedDict):
     checkout_report: str | None
     payment_report: str | None
     shipping_report: str | None
-    followups: list[FollowUpRequest]
-    followup_reports: Annotated[dict[str, str], operator.or_]
+    peer_budget: PeerBudget
+    peer_messages: Annotated[list[PeerMessage], operator.add]
     final_diagnosis: str | None
 
 
-def _model(*, thinking: bool = True) -> ChatOpenAI:
+SERVICE_CONFIG: dict[AgentName, tuple[str, list[BaseTool]]] = {
+    "checkout": ("Checkout", CHECKOUT_TOOLS),
+    "payment": ("Payment", PAYMENT_TOOLS),
+    "shipping": ("Shipping", SHIPPING_TOOLS),
+}
+
+
+def _model() -> ChatOpenAI:
     return ChatOpenAI(
         **MODEL_CONFIG,
         api_key=os.environ["DEEPSEEK_API_KEY"],
-        extra_body={
-            "thinking": {"type": "enabled" if thinking else "disabled"}
-        },
     )
 
 
@@ -102,12 +122,78 @@ def _run_tool_loop(
     return model.invoke(messages).content
 
 
-def _investigate(service: str, incident: str, service_tools: list[BaseTool]) -> str:
+def _answer_peer_question(
+    recipient: AgentName,
+    incident: str,
+    question: str,
+) -> str:
+    service, service_tools = SERVICE_CONFIG[recipient]
+    messages = [
+        SystemMessage(
+            content=f"""You are the {service} SRE agent answering a peer question.
+Use only your own {service} tools and at most {PEER_TOOL_CALLS} tool calls.
+You cannot ask or forward questions to another agent.
+Return a concise answer with evidence and confidence. Do not invent information."""
+        ),
+        HumanMessage(content=f"Incident: {incident}\nPeer question: {question}"),
+    ]
+    return _run_tool_loop(
+        f"{service} peer",
+        messages,
+        service_tools,
+        PEER_TOOL_CALLS,
+    )
+
+
+def _peer_tool(
+    sender: AgentName,
+    incident: str,
+    budget: PeerBudget,
+    peer_messages: list[PeerMessage],
+) -> BaseTool:
+    @tool
+    def ask_agent(agent_name: AgentName, question: str) -> str:
+        """Ask one other service agent one targeted, non-recursive question."""
+        if agent_name == sender:
+            return "Choose another service agent, not yourself."
+
+        denied = budget.reserve(sender)
+        if denied:
+            return denied
+
+        response = _answer_peer_question(agent_name, incident, question)
+        peer_messages.append(
+            {
+                "sender": sender,
+                "recipient": agent_name,
+                "question": question,
+                "response": response,
+            }
+        )
+        return f"{agent_name.title()} peer response:\n{response}"
+
+    return ask_agent
+
+
+def _investigate(
+    agent: AgentName,
+    incident: str,
+    budget: PeerBudget,
+) -> tuple[str, list[PeerMessage]]:
+    service, service_tools = SERVICE_CONFIG[agent]
+    peer_messages: list[PeerMessage] = []
+    available_tools = [
+        *service_tools,
+        _peer_tool(agent, incident, budget, peer_messages),
+    ]
     messages = [
         SystemMessage(
             content=f"""You are the SRE agent responsible only for {service}.
 Investigate independently using only the supplied {service} tools.
 Call one tool at a time and make at most {INITIAL_TOOL_CALLS} tool calls.
+If local evidence leaves a specific dependency uncertainty, you may use ask_agent
+once to ask the responsible peer. Do not ask unless its answer could change or
+materially strengthen your diagnosis. Incorporate any peer evidence in your report.
 Do not invent information.
 
 When you have enough evidence, return a concise report with:
@@ -119,70 +205,38 @@ When you have enough evidence, return a concise report with:
         ),
         HumanMessage(content=f"Incident: {incident}\nInvestigate it yourself."),
     ]
-    return _run_tool_loop(service, messages, service_tools, INITIAL_TOOL_CALLS)
-
-
-def checkout_agent(state: SREState) -> dict[str, str]:
-    report = _investigate(
-        "Checkout",
-        state["incident"],
-        CHECKOUT_TOOLS,
-    )
-    return {"checkout_report": report}
-
-
-def payment_agent(state: SREState) -> dict[str, str]:
-    report = _investigate(
-        "Payment",
-        state["incident"],
-        PAYMENT_TOOLS,
-    )
-    return {"payment_report": report}
-
-
-def shipping_agent(state: SREState) -> dict[str, str]:
-    report = _investigate(
-        "Shipping",
-        state["incident"],
-        SHIPPING_TOOLS,
-    )
-    return {"shipping_report": report}
-
-
-def follow_up(state: FollowUpState) -> dict[str, dict[str, str]]:
-    service, service_tools = {
-        "checkout": ("Checkout", CHECKOUT_TOOLS),
-        "payment": ("Payment", PAYMENT_TOOLS),
-        "shipping": ("Shipping", SHIPPING_TOOLS),
-    }[state["agent"]]
-    messages = [
-        SystemMessage(
-            content=f"""You are the {service} SRE agent in targeted follow-up mode.
-Answer only the coordinator's question using your previous report and, if needed,
-at most {FOLLOWUP_TOOL_CALLS} additional calls to your own {service} tools.
-Do not invent information or investigate other services."""
-        ),
-        HumanMessage(
-            content=f"""Original incident: {state['incident']}
-
-Your previous report:
-{state['previous_report']}
-
-Coordinator question:
-{state['question']}"""
-        ),
-    ]
     report = _run_tool_loop(
         service,
         messages,
-        service_tools,
-        FOLLOWUP_TOOL_CALLS,
+        available_tools,
+        INITIAL_TOOL_CALLS,
     )
-    return {"followup_reports": {state["agent"]: report}}
+    return report, peer_messages
 
 
-def coordinator_assess(state: SREState) -> dict[str, list[FollowUpRequest]]:
-    prompt = f"""You are the incident coordinator. Assess the initial reports.
+def checkout_agent(state: SREState) -> dict[str, object]:
+    report, peer_messages = _investigate(
+        "checkout", state["incident"], state["peer_budget"]
+    )
+    return {"checkout_report": report, "peer_messages": peer_messages}
+
+
+def payment_agent(state: SREState) -> dict[str, object]:
+    report, peer_messages = _investigate(
+        "payment", state["incident"], state["peer_budget"]
+    )
+    return {"payment_report": report, "peer_messages": peer_messages}
+
+
+def shipping_agent(state: SREState) -> dict[str, object]:
+    report, peer_messages = _investigate(
+        "shipping", state["incident"], state["peer_budget"]
+    )
+    return {"shipping_report": report, "peer_messages": peer_messages}
+
+
+def final_coordinator(state: SREState) -> dict[str, str]:
+    prompt = f"""You are the incident coordinator. Synthesize the service reports.
 
 Incident: {state["incident"]}
 
@@ -194,57 +248,6 @@ Payment report:
 
 Shipping report:
 {state["shipping_report"]}
-
-Decide whether the evidence is sufficient for a well-supported root-cause diagnosis.
-If it is insufficient, request targeted local evidence from at most two distinct
-agents. Ask at most one specific, tool-answerable question per selected agent.
-Agents can inspect only their current status, recent logs, and recent traces;
-do not ask for metrics, configuration, or unavailable historical data.
-Do not request follow-up merely to repeat evidence already present."""
-    assessment = (
-        _model(thinking=False)
-        .with_structured_output(
-            CoordinatorAssessment,
-            method="function_calling",
-        )
-        .invoke(prompt)
-    )
-
-    followups: list[FollowUpRequest] = []
-    selected_agents: set[str] = set()
-    if assessment["status"] == "needs_followup":
-        for request in assessment["followups"]:
-            if request["agent"] in selected_agents or not request["question"].strip():
-                continue
-            followups.append(request)
-            selected_agents.add(request["agent"])
-            if len(followups) == 2:
-                break
-
-    return {"followups": followups}
-
-
-def final_coordinator(state: SREState) -> dict[str, str]:
-    followup_reports = state.get("followup_reports", {})
-    followup_text = "\n\n".join(
-        f"{agent.title()} follow-up report:\n{report}"
-        for agent, report in followup_reports.items()
-    ) or "No follow-up was requested."
-    prompt = f"""You are the incident coordinator. Produce the final diagnosis.
-
-Incident: {state["incident"]}
-
-Initial Checkout report:
-{state["checkout_report"]}
-
-Initial Payment report:
-{state["payment_report"]}
-
-Initial Shipping report:
-{state["shipping_report"]}
-
-Targeted follow-up evidence:
-{followup_text}
 
 Return a concise final diagnosis with:
 - root cause
