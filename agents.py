@@ -3,6 +3,7 @@
 import os
 from typing import TypedDict
 
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
 from tools import (
@@ -10,6 +11,8 @@ from tools import (
     get_payment_evidence,
     get_shipping_evidence,
 )
+
+load_dotenv()
 
 MODEL_CONFIG = {
     "model": "deepseek-flash",
